@@ -1,385 +1,473 @@
 // ==UserScript==
-// @name         GTH-HUD — Railway Alerts (Single Line + Slide Down)
-// @namespace    zulu-lab.gth-hud
-// @version      2.0.0
-// @description  Single-line top bar. Alert appears next to GTH-HUD, lasts 6s, then slides down and disappears. Dropdown shows last 10.
-// @author       zulu-lab
+// @name         GTH-HUD – Torn Market & Combat Alerts
+// @namespace    zulu.gth.hud
+// @version      1.3
+// @description  Barra HUD in Torn che mostra DEAL/BIG TX/COMBAT dagli eventi Railway (/hud/recent).
 // @match        https://www.torn.com/*
-// @run-at       document-idle
+// @run-at       document-end
 // @grant        GM_xmlhttpRequest
 // @connect      torn-xanax-sniper-production.up.railway.app
-// @downloadURL  https://raw.githubusercontent.com/zulu-lab/GTH_HUD/main/dist/gth-hud.user.js
-// @updateURL    https://raw.githubusercontent.com/zulu-lab/GTH_HUD/main/dist/gth-hud.user.js
 // ==/UserScript==
 
-(() => {
+(function () {
   "use strict";
 
-  const RAILWAY_BASE = "https://torn-xanax-sniper-production.up.railway.app";
-  const ENDPOINT = "/hud/recent";
-  const LS_KEY = "gth_hud_singleline_v1";
+  // ========= CONFIG =========
+  const LS_KEY = "gth_hud_cfg_v2";
 
-  const POLL_MS = 1000;
-  const LIVE_MS = 6000;           // durata max avviso
-  const ANIM_MS = 240;            // animazione morbida
-  const MAX_HISTORY = 10;
+  // Cambia solo se sposti il server
+  const DEFAULT_BASE = "https://torn-xanax-sniper-production.up.railway.app";
 
-  const st = Object.assign({ token: "" }, safeParse(localStorage.getItem(LS_KEY)));
-  const history = [];
-  const seen = new Map();
+  const POLL_MS = 3500;                 // intervallo polling /hud/recent
+  const TOP_VIS_MS = 7000;              // 7 secondi visibilità ultimo avviso (prima 6)
+  const MAX_LOCAL_AGE_MS = 10 * 60 * 1000; // 10 minuti: oltre vengono nascosti lato HUD
 
-  let pollTimer = null;
-  let hideTimer = null;
-  let currentSig = null;
+  // ========= STATE =========
+  let cfg = loadCfg();
+  let polling = false;
 
-  function safeParse(s) { try { return JSON.parse(s || "{}"); } catch { return {}; } }
-  function save() { localStorage.setItem(LS_KEY, JSON.stringify(st)); }
+  let events = [];          // array eventi "freschi" (max 10 dal server, ripuliti localmente)
+  let latest = null;        // ultimo evento mostrato in top bar
+  let latestId = null;      // firma per capire se c'è un evento nuovo
+  let latestShowUntil = 0;  // timestamp (ms) fino a cui tenerlo visibile
+
+  let ui = null;            // riferimenti DOM
+
+  // ========= CFG =========
+  function loadCfg() {
+    try {
+      const raw = localStorage.getItem(LS_KEY) || "{}";
+      const o = JSON.parse(raw);
+      return {
+        base: typeof o.base === "string" && o.base ? o.base : DEFAULT_BASE,
+        token: typeof o.token === "string" ? o.token : "",
+        enabled: !!o.enabled
+      };
+    } catch {
+      return { base: DEFAULT_BASE, token: "", enabled: false };
+    }
+  }
+
+  function saveCfg() {
+    localStorage.setItem(LS_KEY, JSON.stringify(cfg));
+  }
+
+  // ========= UTIL =========
+  function fmtTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
 
   function fmtMoney(n) {
-    const x = Number(n);
-    if (!Number.isFinite(x)) return "—";
-    return "$" + Math.round(x).toLocaleString();
-  }
-  function fmtTime(ts) {
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return "";
-    return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`;
-  }
-  function openNewTab(url) {
-    if (!url) return;
-    window.open(url, "_blank", "noopener,noreferrer");
+    if (!Number.isFinite(n)) return "$0";
+    return "$" + n.toLocaleString();
   }
 
+  function eventSignature(e) {
+    if (!e) return "";
+    // basta cambiare qualcosa di questi per considerarlo "nuovo"
+    return `${e.kind || "?"}|${e.market || "?"}|${e.event || "?"}|${e.itemId || 0}|${e.ts || 0}`;
+  }
+
+  // ========= RENDER =========
   function ensureUI() {
-    if (document.getElementById("gth_newsbar")) return;
+    if (ui) return;
 
     const bar = document.createElement("div");
-    bar.id = "gth_newsbar";
+    bar.id = "gth_hud_bar";
     bar.style.cssText = `
-      position: fixed; top: 0; left: 0; right: 0;
-      z-index: 9999999;
-      background: rgba(0,0,0,.92);
-      color: #fff;
-      font: 13px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
-      border-bottom: 1px solid rgba(255,255,255,.12);
-      padding: 6px 10px;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 999999;
+      height: 28px;
+      background: rgba(0,0,0,0.86);
+      color: #f5f5f5;
+      font: 12px/28px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      box-sizing: border-box;
+      pointer-events: auto;
     `;
 
-    bar.innerHTML = `
-      <div style="display:flex; align-items:center; gap:10px;">
-        <div style="font-weight:900; letter-spacing:.2px; white-space:nowrap;">GTH-HUD</div>
+    const title = document.createElement("div");
+    title.textContent = "GTH-HUD";
+    title.style.cssText = `
+      font-weight: 900;
+      margin-right: 8px;
+      white-space: nowrap;
+    `;
+    bar.appendChild(title);
 
-        <!-- ALERT INLINE (single line) -->
-        <div id="gth_alert_slot" style="flex:1; min-width:0; display:flex; align-items:center;">
-          <div id="gth_alert" style="
-            display:none;
-            align-items:center;
-            gap:10px;
-            min-width:0;
-            padding: 4px 8px;
-            border: 1px solid rgba(255,255,255,.12);
-            border-radius: 999px;
-            background: rgba(255,255,255,.05);
-            white-space:nowrap;
-            overflow:hidden;
-            text-overflow:ellipsis;
-            transform: translateY(0px);
-            opacity: 1;
-            transition: transform ${ANIM_MS}ms ease, opacity ${ANIM_MS}ms ease;
-          ">
-            <span id="gth_badge" style="font-weight:900; flex:0 0 auto;">DEAL</span>
-            <span id="gth_text" style="min-width:0; overflow:hidden; text-overflow:ellipsis;"></span>
-            <a id="gth_btn_market" href="#" style="
-              flex:0 0 auto;
-              color:#fff; text-decoration:none;
-              border:1px solid rgba(255,255,255,.18);
-              border-radius:999px;
-              padding:3px 10px;
-              font-weight:900;
-            ">Market</a>
-            <a id="gth_btn_attack" href="#" style="
-              display:none;
-              flex:0 0 auto;
-              color:#fff; text-decoration:none;
-              border:1px solid rgba(255,255,255,.18);
-              border-radius:999px;
-              padding:3px 10px;
-              font-weight:900;
-            ">Attack</a>
-          </div>
-        </div>
+    const msg = document.createElement("div");
+    msg.id = "gth_hud_msg";
+    msg.textContent = "—";
+    msg.style.cssText = `
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      opacity: 0.95;
+    `;
+    bar.appendChild(msg);
 
-        <div id="gth_status" style="opacity:.85; white-space:nowrap;">BOOT</div>
+    const btnLog = document.createElement("button");
+    btnLog.textContent = "Log";
+    btnLog.style.cssText = `
+      margin-left: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 0;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #2a2a2a;
+      color: #f5f5f5;
+    `;
+    bar.appendChild(btnLog);
 
-        <button id="gth_btn_dd" style="
-          background: transparent; color:#fff; border:1px solid rgba(255,255,255,.18);
-          border-radius: 999px; padding: 6px 10px; cursor:pointer; font-weight:900;
-          white-space:nowrap;
-        ">⏷ <span id="gth_hist_count">0</span></button>
+    const btnCfg = document.createElement("button");
+    btnCfg.textContent = "⚙︎";
+    btnCfg.style.cssText = `
+      margin-left: 4px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 0;
+      font-size: 11px;
+      cursor: pointer;
+      background: #2a2a2a;
+      color: #f5f5f5;
+    `;
+    bar.appendChild(btnCfg);
 
-        <button id="gth_btn_cfg" title="Config" style="
-          background: transparent; color:#fff; border:1px solid rgba(255,255,255,.18);
-          border-radius: 999px; padding: 6px 10px; cursor:pointer; font-weight:900;
-        ">⚙</button>
-      </div>
-
-      <div id="gth_dropdown" style="
-        display:none;
-        margin-top: 8px;
-        background: rgba(0,0,0,.96);
-        border: 1px solid rgba(255,255,255,.12);
-        border-radius: 12px;
-        padding: 10px;
-        max-width: 1100px;
-      ">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-          <div style="font-weight:900;">Ultimi 10 eventi</div>
-          <button id="gth_btn_close" style="
-            background: transparent; color:#fff; border:1px solid rgba(255,255,255,.18);
-            border-radius: 999px; padding: 6px 10px; cursor:pointer; font-weight:900;
-          ">Chiudi</button>
-        </div>
-        <div id="gth_hist_list" style="display:flex; flex-direction:column; gap:8px;"></div>
-      </div>
+    const panel = document.createElement("div");
+    panel.id = "gth_hud_panel";
+    panel.style.cssText = `
+      position: fixed;
+      top: 28px;
+      left: 0;
+      right: 0;
+      max-height: 260px;
+      background: rgba(0,0,0,0.92);
+      color: #f5f5f5;
+      font: 12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.6);
+      padding: 8px 10px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      display: none;
+      z-index: 999998;
     `;
 
-    document.documentElement.appendChild(bar);
+    const panelTitle = document.createElement("div");
+    panelTitle.textContent = "Ultimi 10 eventi";
+    panelTitle.style.cssText = "font-weight: 800; margin-bottom: 6px;";
+    panel.appendChild(panelTitle);
 
-    // spacer per non coprire UI Torn
-    const pad = document.createElement("div");
-    pad.id = "gth_newsbar_pad";
-    pad.style.cssText = "height: 50px;";
-    document.body.prepend(pad);
+    const list = document.createElement("div");
+    list.id = "gth_hud_list";
+    panel.appendChild(list);
 
-    // dropdown
-    const dd = document.getElementById("gth_dropdown");
-    document.getElementById("gth_btn_dd").onclick = () => {
-      dd.style.display = dd.style.display === "none" ? "block" : "none";
-      renderHistory();
-    };
-    document.getElementById("gth_btn_close").onclick = () => { dd.style.display = "none"; };
+    document.body.appendChild(bar);
+    document.body.appendChild(panel);
 
-    // config
-    document.getElementById("gth_btn_cfg").onclick = () => {
-      const token = prompt("Inserisci HUD_TOKEN (Railway):", st.token || "");
-      if (token != null) {
-        st.token = token.trim();
-        save();
-        restartPolling();
-      }
-    };
+    btnLog.addEventListener("click", () => {
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+    });
 
-    // buttons open new tab
-    document.getElementById("gth_btn_market").onclick = (ev) => {
-      ev.preventDefault();
-      const url = ev.currentTarget.getAttribute("data-url");
-      if (url) openNewTab(url);
-    };
-    document.getElementById("gth_btn_attack").onclick = (ev) => {
-      ev.preventDefault();
-      const url = ev.currentTarget.getAttribute("data-url");
-      if (url) openNewTab(url);
-    };
+    btnCfg.addEventListener("click", () => {
+      showConfigDialog();
+    });
+
+    ui = { bar, msg, panel, list };
   }
 
-  function setStatus(t) {
-    const el = document.getElementById("gth_status");
-    if (el) el.textContent = t;
+  function showConfigDialog() {
+    const token = prompt("HUD token (HUD_TOKEN sul server):", cfg.token || "");
+    if (token == null) return;
+    cfg.token = token.trim();
+    const base = prompt("Base URL server HUD:", cfg.base || DEFAULT_BASE);
+    if (base == null) return;
+    cfg.base = (base.trim() || DEFAULT_BASE).replace(/\/+$/, "");
+    const en = confirm("Abilitare GTH-HUD? (OK = ON, Annulla = OFF)");
+    cfg.enabled = !!en;
+    saveCfg();
+    if (cfg.enabled) startPolling();
   }
 
-  function renderHistory() {
-    const list = document.getElementById("gth_hist_list");
-    if (!list) return;
-    list.innerHTML = "";
+  function formatTopLine(e) {
+    if (!e) return "—";
 
-    if (!history.length) {
-      const d = document.createElement("div");
-      d.style.opacity = ".7";
-      d.textContent = "Nessun evento ancora.";
-      list.appendChild(d);
+    const t = fmtTime(e.ts);
+    const kind = e.kind || "deal";
+    const market = e.market || "";
+
+    if (kind === "combat" || market === "combat") {
+      const c = e.combat || {};
+      const label =
+        (e.event === "intercept" ? "INTERCEPT"
+          : e.event === "retal" ? "RETAL"
+            : "ATTACK");
+      const attacker = c.attackerName || "???";
+      const target = c.targetName || "???";
+      return `${label} · ${t} · ${attacker} → ${target}`;
+    }
+
+    const name = e.itemName || `Item ${e.itemId || "?"}`;
+    const price = fmtMoney(e.price || 0);
+    const qty = Number.isFinite(e.amount) ? e.amount : 0;
+    const tot = Number.isFinite(e.total) ? e.total : (e.price || 0) * qty;
+
+    if (kind === "bigtx") {
+      return `BIG TX · ${t} · ${name} · ${price} x${qty} (Tot ${fmtMoney(tot)})`;
+    }
+
+    return `DEAL · ${t} · ${name} · ${price} x${qty} (Tot ${fmtMoney(tot)})`;
+  }
+
+  function formatListLine(e) {
+    if (!e) return "";
+
+    const t = fmtTime(e.ts);
+    const kind = e.kind || "deal";
+    const market = e.market || "";
+
+    if (kind === "combat" || market === "combat") {
+      const c = e.combat || {};
+      const label =
+        (e.event === "intercept" ? "INTERCEPT"
+          : e.event === "retal" ? "RETAL"
+            : "ATTACK");
+      const attacker = c.attackerName || "???";
+      const target = c.targetName || "???";
+      const result = c.result ? ` · ${c.result}` : "";
+      return `[${t}] ${label}: ${attacker} → ${target}${result}`;
+    }
+
+    const name = e.itemName || `Item ${e.itemId || "?"}`;
+    const price = fmtMoney(e.price || 0);
+    const qty = Number.isFinite(e.amount) ? e.amount : 0;
+    const tot = Number.isFinite(e.total) ? e.total : (e.price || 0) * qty;
+    const label = kind === "bigtx" ? "BIG TX" : "DEAL";
+
+    return `[${t}] ${label}: ${name} · ${price} x${qty} (Tot ${fmtMoney(tot)})`;
+  }
+
+  function render() {
+    ensureUI();
+    const now = Date.now();
+
+    // Top bar
+    if (latest && now <= latestShowUntil) {
+      ui.msg.textContent = formatTopLine(latest);
+    } else {
+      ui.msg.textContent = "—";
+    }
+
+    // Lista ultimi 10
+    ui.list.innerHTML = "";
+    if (!events.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "Nessun evento recente.";
+      empty.style.opacity = "0.8";
+      ui.list.appendChild(empty);
       return;
     }
 
-    for (const p of history.slice(0, MAX_HISTORY)) {
+    for (const e of events) {
       const row = document.createElement("div");
       row.style.cssText = `
-        display:flex; align-items:center; gap:10px;
-        padding: 8px 10px;
-        border: 1px solid rgba(255,255,255,.10);
-        border-radius: 12px;
-        background: rgba(255,255,255,.04);
-        overflow:hidden;
+        padding: 6px 4px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
       `;
 
-      const left = document.createElement("div");
-      left.style.cssText = "white-space:nowrap; font-weight:900;";
-      left.textContent = (p.kind === "bigtx" ? "BIG TX" : "DEAL");
+      const text = document.createElement("div");
+      text.textContent = formatListLine(e);
+      text.style.cssText = `
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      `;
+      row.appendChild(text);
 
-      const mid = document.createElement("div");
-      mid.style.cssText = "flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
-      mid.textContent =
-        `${fmtTime(p.ts)} • ${p.emoji || ""} ${p.itemName || ("Item " + p.itemId)} • ${fmtMoney(p.price)} x${p.amount} ` +
-        `(Tot ${fmtMoney(p.total)}) • ${p.market}:${p.event}`;
+      // Bottoni azione
+      const btnWrap = document.createElement("div");
+      btnWrap.style.cssText = "display:flex; gap:4px;";
 
-      const btns = document.createElement("div");
-      btns.style.cssText = "display:flex; gap:8px; align-items:center;";
+      if (e.kind === "combat" || e.market === "combat") {
+        const c = e.combat || {};
+        const enemyId =
+          e.sellerId ||
+          c.enemyId ||
+          c.attackerId ||
+          c.targetId ||
+          null;
 
-      const mkBtn = (label, url) => {
-        const a = document.createElement("a");
-        a.href = url || "#";
-        a.textContent = label;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.style.cssText = `
-          color:#fff; text-decoration:none;
-          border:1px solid rgba(255,255,255,.18);
-          border-radius:999px; padding:4px 10px; font-weight:900;
-        `;
-        a.onclick = (ev) => { ev.preventDefault(); if (url) openNewTab(url); };
-        return a;
-      };
+        if (enemyId) {
+          const bAtk = document.createElement("button");
+          bAtk.textContent = "Attack";
+          bAtk.style.cssText = btnStyle();
+          bAtk.addEventListener("click", () => {
+            window.open(
+              `https://www.torn.com/loader.php?sid=attack&user2ID=${enemyId}`,
+              "_blank"
+            );
+          });
+          btnWrap.appendChild(bAtk);
+        }
 
-      btns.appendChild(mkBtn("Market", p.marketUrl));
-      if (p.attackUrl) btns.appendChild(mkBtn("Attack", p.attackUrl));
+        if (c.attackLogUrl) {
+          const bLog = document.createElement("button");
+          bLog.textContent = "Log";
+          bLog.style.cssText = btnStyle();
+          bLog.addEventListener("click", () => {
+            window.open(c.attackLogUrl, "_blank");
+          });
+          btnWrap.appendChild(bLog);
+        }
+      } else {
+        if (e.marketUrl) {
+          const bMkt = document.createElement("button");
+          bMkt.textContent = "Market";
+          bMkt.style.cssText = btnStyle();
+          bMkt.addEventListener("click", () => {
+            window.open(e.marketUrl, "_blank");
+          });
+          btnWrap.appendChild(bMkt);
+        }
+        if (e.sellerId) {
+          const bAtk = document.createElement("button");
+          bAtk.textContent = "Attack";
+          bAtk.style.cssText = btnStyle();
+          bAtk.addEventListener("click", () => {
+            window.open(
+              `https://www.torn.com/loader.php?sid=attack&user2ID=${e.sellerId}`,
+              "_blank"
+            );
+          });
+          btnWrap.appendChild(bAtk);
+        }
+      }
 
-      row.appendChild(left);
-      row.appendChild(mid);
-      row.appendChild(btns);
-      list.appendChild(row);
+      if (btnWrap.childElementCount) row.appendChild(btnWrap);
+      ui.list.appendChild(row);
     }
   }
 
-  function pushHistory(payload) {
-    history.unshift(payload);
-    while (history.length > MAX_HISTORY) history.pop();
-    const hc = document.getElementById("gth_hist_count");
-    if (hc) hc.textContent = String(history.length);
+  function btnStyle() {
+    return `
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 0;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #3a3a3a;
+      color: #f5f5f5;
+      white-space: nowrap;
+    `;
   }
 
-  function showAlert(payload) {
-    // single-line: sostituisce sempre l’avviso corrente (niente code visive)
-    const slot = document.getElementById("gth_alert");
-    const badge = document.getElementById("gth_badge");
-    const text = document.getElementById("gth_text");
-    const btnM = document.getElementById("gth_btn_market");
-    const btnA = document.getElementById("gth_btn_attack");
+  // ========= POLLING =========
+  function startPolling() {
+    if (polling) return;
+    polling = true;
 
-    if (!slot || !badge || !text || !btnM || !btnA) return;
-
-    // reset anim (evita “scatti” quando rimpiazzi)
-    slot.style.transition = "none";
-    slot.style.transform = "translateY(0px)";
-    slot.style.opacity = "1";
-    slot.style.display = "inline-flex";
-    // force reflow
-    void slot.offsetHeight;
-    slot.style.transition = `transform ${ANIM_MS}ms ease, opacity ${ANIM_MS}ms ease`;
-
-    badge.textContent = (payload.kind === "bigtx" ? "BIG TX" : "DEAL");
-    text.textContent =
-      `${payload.emoji || ""} ${payload.itemName || ("Item " + payload.itemId)} • ` +
-      `${fmtMoney(payload.price)} x${payload.amount} (Tot ${fmtMoney(payload.total)})`;
-
-    btnM.setAttribute("data-url", payload.marketUrl || "");
-    btnA.setAttribute("data-url", payload.attackUrl || "");
-
-    if (payload.attackUrl) btnA.style.display = "inline-block";
-    else btnA.style.display = "none";
-
-    // timer hide (restarting)
-    if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = setTimeout(() => {
-      // slide down + fade
-      slot.style.transform = "translateY(10px)";
-      slot.style.opacity = "0";
-      // dopo animazione: nascondi
-      setTimeout(() => {
-        slot.style.display = "none";
-      }, ANIM_MS + 30);
-    }, LIVE_MS);
+    ensureUI();
+    render();
+    loop();
   }
 
-  function gmGetJSON(url) {
-    return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method: "GET",
-        url,
-        timeout: 15000,
-        onload: (resp) => {
-          try {
-            const j = JSON.parse(resp.responseText || "{}");
-            resolve({ ok: resp.status >= 200 && resp.status < 300, status: resp.status, json: j });
-          } catch (e) {
-            resolve({ ok: false, status: resp.status || 0, json: null, error: String(e) });
+  function loop() {
+    if (!polling) return;
+    if (!cfg.enabled || !cfg.token || !cfg.base) {
+      setTimeout(loop, POLL_MS);
+      return;
+    }
+
+    const url = `${cfg.base.replace(/\/+$/, "")}/hud/recent?token=${encodeURIComponent(
+      cfg.token
+    )}`;
+
+    GM_xmlhttpRequest({
+      method: "GET",
+      url,
+      timeout: 12000,
+      onload: (resp) => {
+        try {
+          const status = resp.status || 0;
+          if (status < 200 || status >= 300) throw new Error("HTTP " + status);
+          const data = JSON.parse(resp.responseText || "{}");
+          if (!data || data.ok === false) throw new Error("bad payload");
+
+          const now = Date.now();
+          const buf = Array.isArray(data.buffer) ? data.buffer : [];
+
+          // pulizia: teniamo solo eventi <= 10 minuti
+          const fresh = buf.filter((e) => {
+            const ts = Number(e.ts) || 0;
+            return ts > 0 && now - ts <= MAX_LOCAL_AGE_MS;
+          });
+
+          // ordina dal più recente
+          fresh.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+          events = fresh;
+
+          const first = events[0] || null;
+          const sig = eventSignature(first);
+          if (first && sig && sig !== latestId) {
+            latest = first;
+            latestId = sig;
+            latestShowUntil = Date.now() + TOP_VIS_MS;
           }
-        },
-        onerror: (err) => resolve({ ok: false, status: 0, json: null, error: String(err) }),
-        ontimeout: () => resolve({ ok: false, status: 0, json: null, error: "timeout" })
-      });
+
+          render();
+        } catch (e) {
+          // fall silent, ma continuiamo il loop
+          console.warn("[GTH-HUD] poll error:", e.message || e);
+        } finally {
+          setTimeout(loop, POLL_MS);
+        }
+      },
+      onerror: () => {
+        setTimeout(loop, POLL_MS * 2);
+      },
+      ontimeout: () => {
+        setTimeout(loop, POLL_MS * 2);
+      }
     });
   }
 
-  function shouldAccept(payload) {
-    if (!payload || !payload.kind || !payload.ts) return false;
-
-    const sig = `${payload.kind}:${payload.market}:${payload.event}:${payload.itemId}:${payload.price}:${payload.amount}`;
-    const now = Date.now();
-    const last = seen.get(sig);
-    if (last && (now - last) < 30000) return false;
-    seen.set(sig, now);
-
-    if (seen.size > 5000) for (const [k, v] of seen) if (now - v > 60000) seen.delete(k);
-    return true;
-  }
-
-  async function pollOnce() {
-    if (!st.token) { setStatus("NO TOKEN"); return; }
-
-    const url = `${RAILWAY_BASE}${ENDPOINT}?token=${encodeURIComponent(st.token)}`;
-    const res = await gmGetJSON(url);
-
-    if (!res.ok) {
-      if (res.status === 401) setStatus("401 TOKEN?");
-      else if (res.status === 0) setStatus("HTTP0 CONNECT?");
-      else setStatus(`ERR ${res.status}`);
-      return;
-    }
-
-    const buffer = Array.isArray(res.json?.buffer) ? res.json.buffer : [];
-    setStatus(`OK buf:${buffer.length}`);
-
-    // aggiungi nuovi eventi (dal più vecchio al più nuovo) -> se ne arrivano tanti insieme
-    // la barra MOSTRA SOLO L’ULTIMO (single line), ma lo storico li prende tutti.
-    let newestToShow = null;
-
-    for (const p of buffer.slice().reverse()) {
-      if (shouldAccept(p)) {
-        pushHistory(p);
-        newestToShow = p;
-      }
-    }
-
-    // mostra solo l'ultimo arrivato in questo ciclo
-    if (newestToShow) {
-      const sig = `${newestToShow.kind}:${newestToShow.ts}:${newestToShow.itemId}:${newestToShow.price}:${newestToShow.amount}`;
-      if (sig !== currentSig) {
-        currentSig = sig;
-        showAlert(newestToShow);
-      }
-    }
-  }
-
-  function restartPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollOnce(), POLL_MS);
-    pollOnce();
-  }
-
+  // ========= INIT =========
   function init() {
     ensureUI();
-    restartPolling();
+
+    // primo setup se manca token
+    if (!cfg.token) {
+      // non forzo il prompt; l'utente può aprire il menu config
+      console.log("[GTH-HUD] nessun token configurato, clicca ⚙︎ per impostarlo.");
+    }
+
+    if (cfg.enabled) {
+      startPolling();
+    } else {
+      // lascia la barra spenta ma disponibile
+      render();
+    }
   }
 
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
-  else init();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();
