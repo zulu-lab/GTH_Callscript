@@ -1,5 +1,3 @@
-[Federico]
-
 # Torn Quick Bar – User Guide
 A very simple guide for using the script.
 This script adds a small quick bar to Torn so you can prepare help messages fast and paste them into chat with a long press.
