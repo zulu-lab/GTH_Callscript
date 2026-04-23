@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Torn Quick Bar Hybrid Stable
+// @name         GTH Quick Bar Call/Help
 // @namespace    zulu.torn.quickbar.hybridstable
 // @version      1.0.0
 // @description  Profile anchored quick bar + attack floating quick bar with detached global settings panel
