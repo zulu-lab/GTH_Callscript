@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GTH Quick Bar Call/Help
 // @namespace    zulu.torn.quickbar.hybridstable
-// @version      1.0.0
+// @version      1.0.1
 // @description  Profile anchored quick bar + attack floating quick bar with detached global settings panel
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
